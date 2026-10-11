@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: calorie-ai-test
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: FREE_SCANS_PER_DAY
+        value: "10"
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: WEBHOOK_BASE_URL
+        sync: false

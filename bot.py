@@ -1,0 +1,319 @@
+import os
+import json
+import logging
+import sqlite3
+import asyncio
+from datetime import date
+from io import BytesIO
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from aiohttp import web
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FREE_SCANS_PER_DAY = int(os.getenv("FREE_SCANS_PER_DAY", "10"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "calorie_bot.sqlite3")
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+WEBHOOK_PATH = "/telegram-webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+if not BOT_TOKEN:
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment variables")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Set GEMINI_API_KEY in environment variables")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+gemini = genai.Client(api_key=GEMINI_API_KEY)
+
+
+def connect_db():
+    return sqlite3.connect(DATABASE_PATH)
+
+
+def init_db():
+    with connect_db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            daily_goal INTEGER NOT NULL DEFAULT 2000
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS meals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            name TEXT NOT NULL,
+            grams INTEGER NOT NULL,
+            calories INTEGER NOT NULL,
+            protein REAL NOT NULL,
+            fat REAL NOT NULL,
+            carbs REAL NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+def ensure_user(user_id):
+    with connect_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user_id,))
+
+
+def get_goal(user_id):
+    ensure_user(user_id)
+    with connect_db() as conn:
+        return conn.execute("SELECT daily_goal FROM users WHERE user_id=?", (user_id,)).fetchone()[0]
+
+
+def scans_today(user_id):
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM meals WHERE user_id=? AND day=?",
+            (user_id, date.today().isoformat())
+        ).fetchone()[0]
+
+
+def save_meal(user_id, meal):
+    with connect_db() as conn:
+        conn.execute(
+            """INSERT INTO meals(user_id, day, name, grams, calories, protein, fat, carbs)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, date.today().isoformat(), meal["name"], meal["grams"],
+             meal["calories"], meal["protein_g"], meal["fat_g"], meal["carbs_g"])
+        )
+
+
+def get_summary(user_id):
+    with connect_db() as conn:
+        return conn.execute(
+            """SELECT COALESCE(SUM(calories),0), COALESCE(SUM(protein),0),
+                      COALESCE(SUM(fat),0), COALESCE(SUM(carbs),0), COUNT(*)
+               FROM meals WHERE user_id=? AND day=?""",
+            (user_id, date.today().isoformat())
+        ).fetchone()
+
+
+def analyse_food(image_bytes):
+    prompt = """
+Ты анализируешь еду для дневника питания. Верни только корректный JSON без markdown:
+{
+ "name": "короткое название блюда",
+ "estimated_items": ["видимые продукты"],
+ "grams": 250,
+ "calories": 450,
+ "protein_g": 25,
+ "fat_g": 15,
+ "carbs_g": 50,
+ "confidence": "низкая|средняя|высокая",
+ "assumptions": "коротко об оценке порции и неопределённости"
+}
+Оцени примерные калории, белки, жиры и углеводы для видимой порции. Не утверждай,
+что вес можно точно узнать по фото. Если вес или состав неясны, укажи это в assumptions.
+Учитывай масло и соусы только если они видны или разумно предполагаются, и отмечай неопределённость.
+Значения должны быть правдоподобными и согласованными. Не давай медицинских советов.
+"""
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2
+        )
+    )
+    result = json.loads(response.text)
+    required = ["name", "grams", "calories", "protein_g", "fat_g", "carbs_g", "confidence", "assumptions"]
+    for key in required:
+        if key not in result:
+            raise ValueError(f"Missing field: {key}")
+    result["grams"] = max(0, round(float(result["grams"])))
+    result["calories"] = max(0, round(float(result["calories"])))
+    for key in ("protein_g", "fat_g", "carbs_g"):
+        result[key] = max(0, round(float(result[key]), 1))
+    return result
+
+
+def keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Мой день", callback_data="today")
+    kb.button(text="🎯 Цель калорий", callback_data="goal")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    ensure_user(message.from_user.id)
+    await message.answer(
+        "Привет! Я тестовый AI-счётчик калорий 🍽️\\n\\n"
+        "Отправь фото блюда - я оценю калории, белки, жиры и углеводы. "
+        "В тестовой версии доступно до 10 фото в день.\\n\\n"
+        "Команды: /today - дневник, /goal 2000 - цель, /help - инструкция.\\n\\n"
+        "Важно: результат приблизительный. Фото не показывает точно вес, масло и скрытые ингредиенты.",
+        reply_markup=keyboard()
+    )
+
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "Отправь фотографию еды. Я оценю блюдо и автоматически добавлю его в дневник.\\n"
+        "Для более точной оценки можно написать примерный вес порции в подписи к фото.\\n"
+        "Эта версия предназначена для тестирования и не заменяет рекомендации врача или диетолога."
+    )
+
+
+@dp.message(Command("goal"))
+async def goal_cmd(message: Message):
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit() or not 500 <= int(parts[1]) <= 7000:
+        await message.answer("Пример: /goal 2000 (от 500 до 7000 ккал)")
+        return
+    ensure_user(message.from_user.id)
+    with connect_db() as conn:
+        conn.execute("UPDATE users SET daily_goal=? WHERE user_id=?",
+                     (int(parts[1]), message.from_user.id))
+    await message.answer(f"Цель сохранена: {parts[1]} ккал в день.")
+
+
+async def send_today(message: Message, user_id: int):
+    calories, protein, fat, carbs, count = get_summary(user_id)
+    goal = get_goal(user_id)
+    await message.answer(
+        f"📊 Дневник за {date.today().strftime('%d.%m.%Y')}\\n\\n"
+        f"🔥 Калории: {calories} / {goal} ккал\\n"
+        f"До цели: {max(0, goal-calories)} ккал\\n"
+        f"🥩 Белки: {protein:.1f} г\\n🥑 Жиры: {fat:.1f} г\\n"
+        f"🍞 Углеводы: {carbs:.1f} г\\n\\nБлюд добавлено: {count}",
+        reply_markup=keyboard()
+    )
+
+
+@dp.message(Command("today"))
+async def today_cmd(message: Message):
+    await send_today(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "today")
+async def today_button(callback: CallbackQuery):
+    await send_today(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "goal")
+async def goal_button(callback: CallbackQuery):
+    await callback.message.answer("Установи цель командой, например: /goal 2000")
+    await callback.answer()
+
+
+@dp.message(F.photo)
+async def photo_handler(message: Message):
+    user_id = message.from_user.id
+    ensure_user(user_id)
+    if scans_today(user_id) >= FREE_SCANS_PER_DAY:
+        await message.answer(f"Тестовый лимит - {FREE_SCANS_PER_DAY} фото в сутки. Попробуй завтра.")
+        return
+    status = await message.answer("🔎 Анализирую фото через бесплатный тестовый API...")
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buffer = BytesIO()
+        await bot.download_file(file.file_path, destination=buffer)
+        meal = await asyncio.to_thread(analyse_food, buffer.getvalue())
+        save_meal(user_id, meal)
+        summary = get_summary(user_id)
+        items = ", ".join(meal.get("estimated_items", []))
+        await status.edit_text(
+            f"🍽️ {meal['name']}\\n"
+            f"{items + chr(10) if items else ''}"
+            f"⚖️ Примерный вес: {meal['grams']} г\\n"
+            f"🔥 Калории: {meal['calories']} ккал\\n"
+            f"🥩 Белки: {meal['protein_g']} г\\n"
+            f"🥑 Жиры: {meal['fat_g']} г\\n"
+            f"🍞 Углеводы: {meal['carbs_g']} г\\n\\n"
+            f"Уверенность: {meal['confidence']}\\n"
+            f"ℹ️ {meal['assumptions']}\\n\\n"
+            f"Добавлено в дневник. Всего сегодня: {summary[0]} ккал.\\n"
+            "Оценка приблизительная - вес и скрытые ингредиенты могут отличаться.",
+            reply_markup=keyboard()
+        )
+    except Exception:
+        logging.exception("Photo analysis failed")
+        await status.edit_text(
+            "Не удалось распознать фото. Возможно, бесплатный API достиг лимита или временно недоступен. "
+            "Попробуй ещё раз позже."
+        )
+
+
+@dp.message()
+async def other_message(message: Message):
+    await message.answer("Отправь фото еды или выбери действие. Команда /help - инструкция.")
+
+
+async def health(request):
+    return web.Response(text="Calorie AI test bot is running")
+
+
+async def telegram_webhook(request):
+    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        raise web.HTTPUnauthorized()
+    update = await request.json()
+    from aiogram.types import Update
+    await dp.feed_update(bot, Update.model_validate(update))
+    return web.Response(text="OK")
+
+
+async def on_startup(app):
+    init_db()
+    if WEBHOOK_BASE_URL:
+        await bot.set_webhook(
+            WEBHOOK_BASE_URL + WEBHOOK_PATH,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True
+        )
+        logging.info("Webhook mode enabled")
+    else:
+        logging.info("No WEBHOOK_BASE_URL set; use local polling mode")
+
+
+async def on_cleanup(app):
+    if WEBHOOK_BASE_URL:
+        await bot.delete_webhook()
+    await bot.session.close()
+
+
+def create_app():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+
+async def main():
+    init_db()
+    if WEBHOOK_BASE_URL:
+        app = create_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logging.info("Webhook server listening on %s", PORT)
+        await asyncio.Event().wait()
+    else:
+        await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
